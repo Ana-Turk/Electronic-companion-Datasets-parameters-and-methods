@@ -1,0 +1,317 @@
+clc
+clear all
+%% Da results - prepare for MPC
+
+load('resultsDA.mat')
+PG_DA_new={};
+HPower_DA_new={};
+QGS_DA_new={};
+PG_DA=repelem(PG_DA,1,4);
+new_PG=repelem(PG_DA(:,end),[1],[Horizon]);
+PG_CHP=[PG_DA new_PG];
+for ij=1:tmax
+    PG_DA_new{ij}= PG_CHP(:,ij:ij+Horizon-1);
+end
+
+HPower_DA=repelem(HPower_DA,1,4);
+new_PH=repelem(HPower_DA(:,end),[1],[Horizon]);
+PH_Power=[HPower_DA new_PH];
+for ij=1:tmax
+    HPower_DA_new{ij}= PH_Power(:,ij:ij+Horizon-1);
+end
+
+QGS_DA=repelem(QGS_DA,1,4);
+new_QGS=repelem(QGS_DA(:,end),[1],[Horizon]);
+Q_Gas=[QGS_DA new_QGS];
+for ij=1:tmax
+    QGS_DA_new{ij}= Q_Gas(:,ij:ij+Horizon-1);
+end
+
+Cost_all=0;
+%% optimization
+% Define variables
+
+P  = sdpvar(NBus,Horizon);
+an = sdpvar(NBus,Horizon);
+Lshed = sdpvar(NBus,Horizon);
+PWspill = sdpvar(NBus,Horizon);
+Py = sdpvar(NBus,Horizon);
+PyF = sdpvar(nbranch,nbranch,'full'); % only when they are the same
+PG_DA_RT=sdpvar(NBus,Horizon);
+dP= sdpvar(NBus,Horizon);
+
+mass=sdpvar(m_pipes,Horizon);
+Tin=sdpvar(m_pipes,Horizon);
+Tout=sdpvar(m_pipes,Horizon);
+HSin=sdpvar(m_pipes,Horizon);
+HSout=sdpvar(m_pipes,Horizon);
+HPower=sdpvar(m_pipes,Horizon);
+HS=sdpvar(m_pipes,Horizon);
+bin_hin=binvar(m_pipes,Horizon);
+bin_hout=binvar(m_pipes,Horizon);
+tempinout=sdpvar(m_pipes,Horizon);
+mafl=sdpvar(s_nodes,Horizon);
+HPower_DA_RT=sdpvar(m_pipes,Horizon);
+
+SS=sdpvar(pipes_gas,Horizon);
+prs=sdpvar(ng,Horizon);
+QGS=sdpvar(ng,Horizon);
+DCHP=sdpvar(ng,Horizon);
+QP2G=sdpvar(ng,Horizon);
+DP2G=sdpvar(NBus,Horizon);
+QGSTin=sdpvar(ng,Horizon);
+QGSTout=sdpvar(ng,Horizon);
+ST=sdpvar(ng,Horizon);
+DGC=sdpvar(ng,Horizon);
+htp=sdpvar(pipes_gas,Horizon);
+binngs=binvar(pipes_gas,kngs,Horizon); % (t,p,kngs)
+deltangs=sdpvar(pipes_gas,kngs,Horizon); % (t,p,kngs) this one >0
+bingin=binvar(ng,Horizon);
+bingout=binvar(ng,Horizon);
+pipe_tp=sdpvar(pipes_gas,Horizon);
+pipe_tp2=sdpvar(ng,Horizon);
+pipeSy=sdpvar(pipes_gas,kngs,Horizon);
+pipeSx=sdpvar(pipes_gas,kngs,Horizon);
+dGF=sdpvar(ng,Horizon);
+dSS=sdpvar(ng,Horizon);
+QGS_DA_RT=sdpvar(ng,Horizon);
+
+% load state and PG values - initial
+P0=PG_DA(:,1);
+save('previousP0.mat','P0');
+GST0=STinitial;
+save('previousGST0.mat','GST0');
+HS0=HSinitial;
+save('previousHS0.mat','HS0');
+
+for timeX=1:tmax
+    timeX
+RefBus=3;
+Constraints = [];  
+Objective = 0;
+
+load('previousP0.mat')
+load('previousGST0.mat')
+load('previousHS0.mat')
+
+for k = 1:Horizon 
+        P((setdiff(ALL_BUS,havePG)),k)=0;  
+        Lshed((setdiff(ALL_BUS,haveLE)),k)=0;  
+        an(RefBus,k)=0;
+        PWspill((setdiff(ALL_BUS,havePW)),k)=0;
+        DP2G((setdiff(ALL_BUS,haveDP2G)),k)=0;   
+        PG_DA_RT((setdiff(ALL_BUS,havePG)),k)=0;  
+ 
+    for n1=1:NBus
+        Py(n1,k) =0;
+        for n2=1:NBus
+            Py(n1,k)= Py(n1,k)+B(n1,n2)*(an(n1,k)-an(n2,k)) ;
+        end
+    end
+
+    for n1=1:NBus
+        dP(:,k)= P(:,k)+windy_MPC{timeX}(:,k)-PWspill(:,k)+Lshed(:,k) -Py(:,k) - loady_MPC{timeX}(:,k) - DP2G(:,k);  
+        Constraints = [Constraints, dP(:,k)==0 ];
+         
+    end
+    
+    Constraints= [Constraints, Lshed(:,k) >= 0; Lshed(:,k) <=loady_MPC{timeX}(:,k)];
+    Constraints= [Constraints, P(:,k) >= Pmin; P(:,k) <=Pmax];
+    Constraints= [Constraints, PWspill(:,k) >= 0; PWspill(:,k) <=windy_MPC{timeX}(:,k)];
+    Constraints= [Constraints, DP2G(:,k) >= 0];
+        
+          for l2=1:nbranch
+              
+           Constraints = [Constraints, (1/x(l2))*(an(fb(l2),k)-an(tb(l2),k))<= rate(l2))];
+           Constraints = [Constraints, (1/x(l2))*(an(fb(l2),k)-an(tb(l2),k)))>= -rate(l2))];
+          end
+          
+    Constraints= [Constraints, P(:,1)-P0 <= deltaPmin; P0-P(:,1) <=deltaPmax];
+    for j = 2:Horizon 
+        Constraints= [Constraints, P(:,j)-P(:,j-1)<= deltaPmin; P(:,j-1)-P(:,j) <=deltaPmax];
+    end
+    
+% DHS contraints    
+  
+    Tin(7,:)=80;
+    HS((haveHS),1)=HS0(haveHS);
+    HS((setdiff(All_pipes,haveHS)),k)=0;
+    HSin((setdiff(All_pipes,haveHS)),k)=0;
+    HSout((setdiff(All_pipes,haveHS)),k)=0;
+    HPower((setdiff(All_pipes,haveHPower)),k)=0;
+    HPower_DA_RT((setdiff(All_pipes,haveHPower)),k)=0;
+    
+    Constraints= [Constraints, mass(:,k) >= massmin; mass(:,k) <=massmax];
+    Constraints= [Constraints, HPower(:,k) >= 0; HPower(:,k) <=1];
+    Constraints= [Constraints, Tin(:,k) >= Tmin; Tin(:,k) <=Tmax];
+    Constraints= [Constraints, Tout(:,k) >= Tmin; Tout(:,k) <=Tmax];
+  
+
+    Constraints= [Constraints, HS(:,k) >= HSlow; HS(:,k) <= HSup];
+    Constraints= [Constraints, HSin(:,k) >= HSmin; HSin(:,k) <= bin_hin(:,k).*HSinmax ];
+    Constraints= [Constraints, HSout(:,k) >= HSmin; HSout(:,k) <= bin_hout(:,k).*HSoutmax ];
+    Constraints= [Constraints, bin_hin(:,k)+bin_hout(:,k)<= 1 ];
+
+   
+    HS(:,(k+1))= HS(:,k)-HSin(:,k)+HSout(:,k);
+    
+    for snodes=1:s_nodes
+        mafl(snodes,k)=0;
+        for mpipes1=1:m_pipes
+            mafl(snodes,k)=mafl(snodes,k)+flow(snodes,mpipes1)*mass(mpipes1,k);
+        end
+    end
+    for snodes=1:s_nodes
+        Constraints =[Constraints,mafl(snodes,k) == 0 ];
+    end
+  
+    for mpipes1=1:m_pipes
+        tempinout(mpipes1,k) =0;
+        for mpipes2=1:m_pipes
+            tempinout(mpipes1,k)= tempinout(mpipes1,k)+ temp(mpipes1,mpipes2)*Tin(mpipes2,k) ;
+        end
+    end
+    nomix_out=nomix_out';
+    for mpipes1=1:m_pipes
+        Constraints =[Constraints, (nomix_out(:).*Tout(:,k)) - tempinout(:,k)==0 ];
+    end
+    
+    Constraints = [Constraints,(Cp.* ( (TMT2(7,k)+TinT(7,k)*mass(7,k)+m0(7,k)*Tin(7,k)) - (TMT(7,k)+ToutT(7,k)*mass(7,k)+m0(7,k)*Tout(7,k))   )  ) ==  HPower(7,k)];
+    Constraints = [Constraints,(Cp.* ( (TMT2(3,k)+TinT(3,k)*mass(3,k)+m0(3,k)*Tin(3,k)) - (TMT(3,k)+ToutT(3,k)*mass(3,k)+m0(3,k)*Tout(3,k))   )  ) == (HSin(3,k) - HSout(3,k))];
+    Constraints = [Constraints,(Cp.* ( (TMT2(5,k)+TinT(5,k)*mass(5,k)+m0(5,k)*Tin(5,k)) - (TMT(5,k)+ToutT(5,k)*mass(5,k)+m0(5,k)*Tout(5,k))   )  ) == - (Heat_loady_MPC{timeX}(5,k))];
+    
+    % Tempdrop .. 
+    droptemp=droptemp';
+    for dptemp=find(droptemp)
+        Constraints =[Constraints, (Tin(dptemp,k)-Ta) - Tout(dptemp,k).*Ae(dptemp,k) + (Ta.*(Ae(dptemp,k)+(Be(dptemp,k).*mass(dptemp,k)) )) == Be(dptemp,k).*(TMT(dptemp,k)+ToutT(dptemp,k).*mass(dptemp,k)+m0(dptemp,k).*Tout(dptemp,k))  ];
+    end
+
+    % Tempmix .. 
+    for tmix=mixingnode
+        Constraints = [Constraints,( TMT2((tmix-1),k)+TinT((tmix-1),k)*mass((tmix-1),k)+m0((tmix-1),k)*Tin((tmix-1),k) )+ ( TMT2(tmix,k)+TinT(tmix,k)*mass(tmix,k)+m0(tmix,k)*Tin(tmix,k) ) == TMT((tmix+1),k)+ToutT((tmix+1),k)*mass((tmix+1),k)+m0((tmix+1),k)*Tout((tmix+1),k)  ];
+    end
+    
+    % NGS:
+    prs(1,k)=1;
+    ST(haveGST,1)=GST0(haveGST);
+    ST((setdiff(ALL_NodesG,haveGST)),k)=0;
+    QGSTin((setdiff(ALL_NodesG,haveGST)),:)=0;
+    QGSTout((setdiff(ALL_NodesG,haveGST)),:)=0;
+    QGS((setdiff(ALL_NodesG,haveQGS)),k)=0;
+    DCHP((setdiff(ALL_NodesG,haveDCHP)),k)=0;
+    DGC((setdiff(ALL_NodesG,haveDGC)),k)=0;
+    QP2G((setdiff(ALL_NodesG,haveQP2G)),k)=0;
+    QGS_DA_RT((setdiff(ALL_NodesG,haveQGS)),k)=0;
+    
+   
+    for pipesG=1:pipes_gas                     
+        Constraints =[Constraints,(prs(fnG(pipesG),k)-prs(tnG(pipesG),k))/ZR(pipesG) == htp(pipesG,k) ];
+        DGC(pipesG,k) = (SS(pipesG,k).* (lambda_gc(pipesG)));
+        Constraints =[Constraints, prs(tnG(pipesG),k) <= (CR(pipesG))^2.*prs(fnG(pipesG),k)];
+    end
+    
+    for pipesG=1:pipes_gas 
+        for kngG=1:kngs-1
+            pipeSy(pipesG,kngG,k)=pipeSy(pipesG,kngG,k) + (( hval2(pipesG,kngG+1,k)-hval2(pipesG,kngG,k)  ) * deltangs(pipesG,kngG,k) );
+        end
+     end
+     for pipesG=1:pipes_gas
+        for kngG=1:kngs
+            Constraints =[Constraints, htp(pipesG,k) == SSh(pipesG) + pipeSy(pipesG,kngG,k)];
+        end
+     end
+ 
+    for pipesG=1:pipes_gas 
+        for kngG=1:kngs-1
+            pipeSx(pipesG,kngG,k)=pipeSx(pipesG,kngG,k) + (( Sval2(pipesG,kngG+1,k)-Sval2(pipesG,kngG,k)  ) * deltangs(pipesG,kngG,k) );
+        end
+    end
+    for pipesG=1:pipes_gas
+        for kngG=1:kngs
+            Constraints =[Constraints, SS(pipesG,k) == SSlo(pipesG) + pipeSx(pipesG,kngG,k)];
+        end
+    end
+
+    for pipesG=1:pipes_gas
+        for kngG=1:kngs
+            Constraints =[Constraints, deltangs(pipesG,kngs,k) >= 0; deltangs(pipesG,kngs,k) <= 1];
+        end
+    end
+
+    for pipesG=1:pipes_gas
+        for kngG=1:kngs-1
+            Constraints =[Constraints, binngs(pipesG,kngG,k) <= deltangs(pipesG,kngG,k) ; binngs(pipesG,kngG,k) >= deltangs(pipesG,kngG+1,k)  ];
+        end
+    end
+
+    for nodesG=1:ng
+        out_idx = find(fnG(:)==nodesG);
+        in_idx = find(tnG(:)==nodesG); 
+        dSS(nodesG,k)=sum( SS(in_idx,k)) - sum( SS(out_idx,k ));
+    end
+    
+    for nodesG=1:ng
+        dGF(:,k)= QGS(:,k) + (-QGSTin(:,k) + QGSTout(:,k)) + ...
+            QP2G(:,k) - Gas_loady_MPC{timeX}(:,k) - DGC(:,k) - DCHP(:,k) + dSS(:,k) ;
+    Constraints= [Constraints, dGF(:,k) == 0];   
+    end
+
+    Constraints= [Constraints, QGSTin(:,k) >= GSTmin; QGSTin(:,k) <= bingin(:,k).*GSTinmax ];
+    Constraints= [Constraints, QGSTout(:,k) >= GSTmin; QGSTout(:,k) <= bingout(:,k).*GSToutmax ];
+    Constraints= [Constraints, (bingin(:,k) + bingout(:,k)) <= 1 ];
+    Constraints= [Constraints, ST(:,k) >= STlow; ST(:,k) <= STup];
+
+    ST(:,(k+1))=ST(:,k) + QGSTin(:,k) - QGSTout(:,k);
+     
+    Constraints= [Constraints, QGS(:,k) >= Gmin; QGS(:,k) <= Gmax];
+    Constraints= [Constraints, prs(:,k) >= 0.25; prs(:,k) <= 4];
+    Constraints= [Constraints, SS(:,k) >= SSlo; SS(:,k) <= SSup];
+    Constraints= [Constraints, QP2G(:,k) >= 0; QP2G(:,k) <= P2gmax];
+    Constraints= [Constraints, DGC(:,k) >= 0];
+    Constraints= [Constraints, DCHP(:,k) >= 0];
+ 
+    % Connect
+
+    Constraints= [Constraints, P((havePG),k) == (miE * DCHP((haveDCHP),k))];
+    Constraints= [Constraints, (HPower((haveHPower),k) - (miH * DCHP((haveDCHP),k))) == 0];
+    Constraints= [Constraints, (QP2G((haveQP2G),k) - (miP2G * DP2G((haveDP2G),k)) ) == 0];
+         %Penalty for deviating from DA
+    Constraints= [Constraints, PG_DA_RT(:,k) >= P(:,k) - PG_DA_new{timeX}(:,k) ];
+    Constraints= [Constraints, PG_DA_RT(:,k) >=  - P(:,k) + PG_DA_new{timeX}(:,k) ];
+    Constraints= [Constraints, QGS_DA_RT(:,k) >= QGS(:,k) - QGS_DA_new{timeX}(:,k) ];
+    Constraints= [Constraints, QGS_DA_RT(:,k) >=  - QGS(:,k) + QGS_DA_new{timeX}(:,k) ];
+    Constraints= [Constraints, HPower_DA_RT(:,k) >= HPower(:,k) - HPower_DA_new{timeX}(:,k) ];
+    Constraints= [Constraints, HPower_DA_RT(:,k) >=  - HPower(:,k) + HPower_DA_new{timeX}(:,k) ];
+     
+     
+    Objective = Objective + Cgen*P(:,k) + C_HPower*HPower(:,k) + C_HSin*HSin(:,k) + C_HSout*HSout(:,k) + ...
+        Vd*Lshed(:,k) + CWspill*PWspill(:,k)  + CQS*QGS(:,k) + Cin*QGSTin(:,k) + Cout*QGSTout(:,k) + CP2G*QP2G(:,k)+...
+        Lambda_penaltyP*PG_DA_RT(:,k) + Lambda_penaltyG*QGS_DA_RT(:,k) + Lambda_penaltyH*HPower_DA_RT(:,k) ;
+   
+   Cost=Objective;       
+
+end
+
+options = sdpsettings('verbose',1,'warning',1,'showprogress',1,'savesolverinput',1,'savesolveroutput',1,'debug',1,'solver','mosek');
+sol=optimize(Constraints,Objective,options); 
+param.MSK_IPAR_INFEAS_REPORT_AUTO = 'MSK_ON'
+zz=value(Cost)
+Genpower=value(P)
+if sol.problem == 0
+ solution = value(Cost)
+else
+ display('Hmm, something went wrong!');
+ sol.info
+ yalmiperror(sol.problem)
+end
+% save values for additional constraints for scheduling horizon
+P0=value(P(:,1));
+save('previousP0','P0');
+
+GST0=value(ST(:,2));
+save('previousGST0','GST0');
+
+HS0=value(HS(:,2));
+save('previousHS0','HS0');
+
+end
